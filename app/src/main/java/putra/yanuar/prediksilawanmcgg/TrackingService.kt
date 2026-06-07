@@ -1,0 +1,583 @@
+package putra.yanuar.prediksilawanmcgg
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.graphics.Color
+import android.graphics.PixelFormat
+import android.graphics.Typeface
+import android.os.Build
+import android.os.IBinder
+import android.util.DisplayMetrics
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.widget.Button
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
+import androidx.core.app.NotificationCompat
+
+class TrackingService : Service() {
+
+    private lateinit var windowManager: WindowManager
+    private lateinit var floatingView: LinearLayout
+    private lateinit var collapsedView: Button
+    private lateinit var expandedView: LinearLayout
+    private lateinit var titleText: TextView
+    private lateinit var buttonsContainer: LinearLayout
+    private lateinit var scrollView: ScrollView
+    private lateinit var wmParams: WindowManager.LayoutParams
+
+    // Popup edit yang melayang terpisah dari panel utama
+    private var popupView: LinearLayout? = null
+    private var popupParams: WindowManager.LayoutParams? = null
+
+    companion object {
+        private const val CHANNEL_ID = "MCGGTrackerChannel"
+        private const val NOTIF_ID = 1
+        private const val TOTAL_ENEMIES = 7
+    }
+
+    private val enemyNames = mutableMapOf<Int, String>()
+    private val eliminatedSlots = mutableMapOf<Int, Boolean>()
+    private val cycleSlots = ArrayList<Int>()
+    private var currentRound = 1
+    private var isCycleLocked = false
+    private var cycleIndex = 0
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        startForegroundNotification()
+        for (i in 1..TOTAL_ENEMIES) {
+            enemyNames[i] = "Musuh $i"
+            eliminatedSlots[i] = false
+        }
+        setupLayouts()
+    }
+
+    private fun startForegroundNotification() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(CHANNEL_ID, "MC GG Tracker", NotificationManager.IMPORTANCE_LOW)
+                .apply { description = "Tracker musuh berjalan di latar belakang" }
+            getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+        }
+        val notif = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("MC GG Tracker Aktif")
+            .setContentText("Tracker sedang memantau giliran musuh")
+            .setSmallIcon(android.R.drawable.ic_menu_view)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+        startForeground(NOTIF_ID, notif)
+    }
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun getScreenDimensions(): Pair<Int, Int> {
+        val dm = DisplayMetrics()
+        @Suppress("DEPRECATION") windowManager.defaultDisplay.getMetrics(dm)
+        return Pair(dm.widthPixels, dm.heightPixels)
+    }
+
+    private fun isLandscape() =
+        resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+
+    private fun displayName(slot: Int) = enemyNames[slot] ?: "Musuh $slot"
+    private fun activeSlots() = (1..TOTAL_ENEMIES).filter { eliminatedSlots[it] == false }
+
+    // ── Layout utama ─────────────────────────────────────────────────────────
+    private fun setupLayouts() {
+        floatingView = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        collapsedView = Button(this).apply {
+            text = "MC"
+            textSize = 13f
+            setTypeface(null, Typeface.BOLD)
+            setBackgroundColor(Color.parseColor("#FF6200EE"))
+            setTextColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(dp(60), dp(40))
+        }
+
+        expandedView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#F0111111"))
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(dp(270), LinearLayout.LayoutParams.WRAP_CONTENT)
+        }
+
+        // Header
+        val headerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        titleText = TextView(this).apply {
+            text = "Ronde: 1\nTap musuh saat muncul"
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            setTypeface(null, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val btnClose = Button(this).apply {
+            text = "✕"
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#CC991111"))
+            layoutParams = LinearLayout.LayoutParams(dp(36), dp(32))
+            setPadding(0, 0, 0, 0)
+            setOnClickListener { closePopup(); stopSelf() }
+        }
+        headerRow.addView(titleText)
+        headerRow.addView(btnClose)
+        expandedView.addView(headerRow)
+
+        // Divider
+        expandedView.addView(View(this).apply {
+            setBackgroundColor(Color.parseColor("#55FFFFFF"))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(1)
+            ).also { it.setMargins(0, dp(5), 0, dp(5)) }
+        })
+
+        // Hint
+        expandedView.addView(TextView(this).apply {
+            text = "Tap=catat/prediksi  |  Tahan=edit nama/eliminasi"
+            setTextColor(Color.parseColor("#99FFFFFF"))
+            textSize = 9f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { it.setMargins(0, 0, 0, dp(4)) }
+        })
+
+        // ScrollView tombol musuh
+        scrollView = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = true
+            isFillViewport = false
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(230)
+            )
+        }
+        buttonsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+        buildEnemyButtons()
+        scrollView.addView(buttonsContainer)
+        expandedView.addView(scrollView)
+
+        // Reset
+        expandedView.addView(Button(this).apply {
+            text = "🔄 RESET SIKLUS"
+            textSize = 11f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#CC880000"))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(34)
+            ).also { it.setMargins(0, dp(5), 0, 0) }
+            setPadding(0, 0, 0, 0)
+            setOnClickListener { resetAll() }
+        })
+
+        floatingView.addView(collapsedView)
+        floatingView.addView(expandedView)
+
+        val layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
+        wmParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            layoutFlag,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 20; y = 80
+        }
+
+        windowManager.addView(floatingView, wmParams)
+        setupMovementAndClickLogic()
+    }
+
+    private fun recalcScrollHeight() {
+        val (_, h) = getScreenDimensions()
+        val ratio = if (isLandscape()) 0.45 else 0.45
+        val lp = scrollView.layoutParams as LinearLayout.LayoutParams
+        lp.height = (h * ratio).toInt()
+        scrollView.layoutParams = lp
+    }
+
+    // ── Tombol musuh ─────────────────────────────────────────────────────────
+    private fun buildEnemyButtons() {
+        buttonsContainer.removeAllViews()
+
+        for (i in 1..TOTAL_ENEMIES) {
+            val isElim = eliminatedSlots[i] == true
+            val inCycle = cycleSlots.contains(i)
+            val isPredicted = isCycleLocked && !isElim &&
+                    cycleSlots.isNotEmpty() && cycleSlots[cycleIndex] == i
+
+            val bgColor = when {
+                isElim      -> Color.parseColor("#1A1A1A")
+                isPredicted -> Color.parseColor("#886600")
+                inCycle     -> Color.parseColor("#224422")
+                else        -> Color.parseColor("#333355")
+            }
+            val label = when {
+                isElim      -> "💀 ${displayName(i)}"
+                isPredicted -> "★ ${displayName(i)}"
+                inCycle     -> "✔ ${displayName(i)}"
+                else        -> "⚔ ${displayName(i)}"
+            }
+
+            val btn = Button(this).apply {
+                text = label
+                textSize = 11f
+                setPadding(dp(8), 0, dp(8), 0)
+                isEnabled = true
+                alpha = if (isElim) 0.4f else 1.0f
+                setBackgroundColor(bgColor)
+                setTextColor(if (isElim) Color.GRAY else Color.WHITE)
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, dp(36)
+                ).also { it.setMargins(0, dp(3), 0, dp(3)) }
+
+                setOnClickListener { handleEnemyTap(i) }
+                setOnLongClickListener { showEditPopup(i); true }
+            }
+            buttonsContainer.addView(btn)
+        }
+    }
+
+    // ── Popup edit TERPISAH di WindowManager ─────────────────────────────────
+    // Popup ini melayang di tengah layar, TIDAK terpotong apapun
+    private fun showEditPopup(slot: Int) {
+        closePopup() // tutup popup lama jika ada
+
+        val isElim = eliminatedSlots[slot] == true
+        val name = displayName(slot)
+        val (screenW, screenH) = getScreenDimensions()
+
+        val layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
+        // Lebar popup: 80% lebar layar (maks 400dp)
+        val popupWidthPx = minOf((screenW * 0.80).toInt(), dp(400))
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#FF1A1A2E"))
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            elevation = 20f
+        }
+
+        // Judul popup
+        container.addView(TextView(this).apply {
+            text = "✏️ Edit Musuh ${slot}"
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            setTypeface(null, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { it.setMargins(0, 0, 0, dp(12)) }
+        })
+
+        // Label nama
+        container.addView(TextView(this).apply {
+            text = "Nama musuh:"
+            setTextColor(Color.parseColor("#BBFFFFFF"))
+            textSize = 11f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { it.setMargins(0, 0, 0, dp(4)) }
+        })
+
+        // Input nama
+        val editName = EditText(this).apply {
+            setText(name)
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            hint = "Nama musuh..."
+            textSize = 13f
+            setBackgroundColor(Color.parseColor("#FF2A2A4A"))
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(44)
+            ).also { it.setMargins(0, 0, 0, dp(14)) }
+            // Pilih semua teks agar mudah langsung ganti
+            selectAll()
+        }
+        container.addView(editName)
+
+        // Divider
+        container.addView(View(this).apply {
+            setBackgroundColor(Color.parseColor("#44FFFFFF"))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(1)
+            ).also { it.setMargins(0, 0, 0, dp(12)) }
+        })
+
+        // Baris tombol aksi
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        fun makeBtn(label: String, bg: String, action: () -> Unit) = Button(this).apply {
+            text = label
+            textSize = 11f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor(bg))
+            layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f)
+                .also { it.setMargins(dp(3), 0, dp(3), 0) }
+            setPadding(0, 0, 0, 0)
+            setOnClickListener { action() }
+        }
+
+        val btnSave = makeBtn("💾 Simpan", "#CC1A5C1A") {
+            val newName = editName.text.toString().trim()
+            if (newName.isNotEmpty()) {
+                enemyNames[slot] = newName
+                Toast.makeText(this, "Nama disimpan: $newName", Toast.LENGTH_SHORT).show()
+            }
+            closePopup()
+            buildEnemyButtons()
+            updateDisplay()
+        }
+
+        val btnElim = makeBtn(
+            if (isElim) "✅ Aktifkan" else "💀 Eliminasi",
+            if (isElim) "#CC226622" else "#CC881111"
+        ) {
+            closePopup()
+            toggleElimination(slot)
+        }
+
+        val btnCancel = makeBtn("✕ Batal", "#CC444444") {
+            closePopup()
+        }
+
+        btnRow.addView(btnSave)
+        btnRow.addView(btnElim)
+        btnRow.addView(btnCancel)
+        container.addView(btnRow)
+
+        // Bungkus dalam ScrollView agar aman di landscape
+        val sv = ScrollView(this).apply {
+            isFillViewport = true
+            addView(container)
+        }
+
+        // Params popup: DITENGAH layar, focusable agar keyboard bisa muncul
+        val pp = WindowManager.LayoutParams(
+            popupWidthPx,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            layoutFlag,
+            // FOCUSABLE agar EditText bisa diketik
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.CENTER   // ← selalu di tengah layar
+            x = 0; y = 0
+        }
+
+        // Simpan referensi untuk bisa dihapus nanti
+        popupView = container  // simpan container agar bisa di-remove
+        popupParams = pp
+
+        // Tambahkan ScrollView (bukan container langsung) ke WindowManager
+        // Tapi kita perlu simpan sv agar bisa di-remove
+        // Gunakan wrapper trick
+        val wrapperRef = arrayOfNulls<LinearLayout>(1)
+        val wrapper = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(sv)
+        }
+        wrapperRef[0] = wrapper
+
+        windowManager.addView(wrapper, pp)
+
+        // Simpan wrapper di popupView agar closePopup() bisa remove-nya
+        @Suppress("UNCHECKED_CAST")
+        popupView = wrapper
+    }
+
+    private fun closePopup() {
+        popupView?.let {
+            try { windowManager.removeView(it) } catch (_: Exception) {}
+            popupView = null
+            popupParams = null
+        }
+    }
+
+    // ── Handle tap musuh ─────────────────────────────────────────────────────
+    private fun handleEnemyTap(slot: Int) {
+        if (eliminatedSlots[slot] == true) {
+            Toast.makeText(this, "${displayName(slot)} dieliminasi. Tahan untuk opsi.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val active = activeSlots()
+
+        if (!isCycleLocked) {
+            if (cycleSlots.contains(slot)) {
+                Toast.makeText(this, "${displayName(slot)} sudah tercatat!", Toast.LENGTH_SHORT).show()
+                return
+            }
+            cycleSlots.add(slot)
+            currentRound++
+
+            if (cycleSlots.size == active.size) {
+                isCycleLocked = true
+                cycleIndex = 0
+                val next = cycleSlots[cycleIndex]
+                titleText.text = "Ronde: $currentRound ✅ Terkunci!\nPrediksi:\n★ ${displayName(next)} ★"
+            } else {
+                val rem = active.size - cycleSlots.size
+                titleText.text = "Ronde: $currentRound\nTercatat: ${cycleSlots.size}/${active.size}\nSisa $rem lagi..."
+            }
+            buildEnemyButtons()
+        } else {
+            val expectedSlot = cycleSlots[cycleIndex]
+            val warn = if (slot != expectedSlot) "\n⚠ Tidak sesuai prediksi!" else ""
+            currentRound++
+
+            var nextIndex = (cycleIndex + 1) % cycleSlots.size
+            var safety = 0
+            while (eliminatedSlots[cycleSlots[nextIndex]] == true && safety < cycleSlots.size) {
+                nextIndex = (nextIndex + 1) % cycleSlots.size
+                safety++
+            }
+            cycleIndex = nextIndex
+            val next = cycleSlots[cycleIndex]
+            titleText.text = "Ronde: $currentRound$warn\nPrediksi selanjutnya:\n★ ${displayName(next)} ★"
+            buildEnemyButtons()
+        }
+    }
+
+    // ── Toggle eliminasi ─────────────────────────────────────────────────────
+    private fun toggleElimination(slot: Int) {
+        val wasElim = eliminatedSlots[slot] == true
+        eliminatedSlots[slot] = !wasElim
+
+        if (!wasElim) {
+            if (isCycleLocked) {
+                val curSlot = cycleSlots.getOrNull(cycleIndex)
+                if (curSlot == slot) {
+                    var nextIdx = (cycleIndex + 1) % cycleSlots.size
+                    var safety = 0
+                    while (eliminatedSlots[cycleSlots[nextIdx]] == true && safety < cycleSlots.size) {
+                        nextIdx = (nextIdx + 1) % cycleSlots.size
+                        safety++
+                    }
+                    cycleIndex = nextIdx
+                }
+                val activeInCycle = cycleSlots.count { eliminatedSlots[it] == false }
+                if (activeInCycle == 0) {
+                    isCycleLocked = false; cycleSlots.clear(); cycleIndex = 0
+                    titleText.text = "Ronde: $currentRound\nSemua musuh dieliminasi!"
+                } else updateDisplay()
+            }
+            Toast.makeText(this, "💀 ${displayName(slot)} dieliminasi", Toast.LENGTH_SHORT).show()
+        } else {
+            val active = activeSlots()
+            val inCycle = cycleSlots.filter { eliminatedSlots[it] == false }
+            if (isCycleLocked || (inCycle.size == active.size && cycleSlots.isNotEmpty()))
+                isCycleLocked = true
+            Toast.makeText(this, "✅ ${displayName(slot)} aktif kembali!", Toast.LENGTH_SHORT).show()
+            updateDisplay()
+        }
+        buildEnemyButtons()
+    }
+
+    private fun updateDisplay() {
+        val active = activeSlots()
+        val inCycle = cycleSlots.filter { eliminatedSlots[it] == false }
+        if (isCycleLocked && cycleSlots.isNotEmpty()) {
+            val next = cycleSlots[cycleIndex]
+            titleText.text = "Ronde: $currentRound ✅\nPrediksi:\n★ ${displayName(next)} ★"
+        } else {
+            titleText.text = "Ronde: $currentRound\nTercatat: ${inCycle.size}/${active.size}"
+        }
+    }
+
+    private fun resetAll() {
+        cycleSlots.clear()
+        currentRound = 1; cycleIndex = 0; isCycleLocked = false
+        for (i in 1..TOTAL_ENEMIES) {
+            eliminatedSlots[i] = false
+            enemyNames[i] = "Musuh $i"
+        }
+        buildEnemyButtons()
+        titleText.text = "Ronde: 1\nTap musuh saat muncul"
+        Toast.makeText(this, "Semua di-reset!", Toast.LENGTH_SHORT).show()
+    }
+
+    // ── Drag & toggle expand ─────────────────────────────────────────────────
+    private fun setupMovementAndClickLogic() {
+        var initialX = 0; var initialY = 0
+        var initialTouchX = 0f; var initialTouchY = 0f
+        var isDragging = false
+
+        collapsedView.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    initialX = wmParams.x; initialY = wmParams.y
+                    initialTouchX = event.rawX; initialTouchY = event.rawY
+                    isDragging = false; true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (event.rawX - initialTouchX).toInt()
+                    val dy = (event.rawY - initialTouchY).toInt()
+                    if (Math.abs(dx) > 8 || Math.abs(dy) > 8) isDragging = true
+                    if (isDragging) {
+                        wmParams.x = initialX + dx; wmParams.y = initialY + dy
+                        windowManager.updateViewLayout(floatingView, wmParams)
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!isDragging) {
+                        if (expandedView.visibility == View.VISIBLE) {
+                            expandedView.visibility = View.GONE
+                            wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        } else {
+                            recalcScrollHeight()
+                            expandedView.visibility = View.VISIBLE
+                            wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                                    WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
+                        }
+                        windowManager.updateViewLayout(floatingView, wmParams)
+                    }
+                    true
+                }
+                else -> false
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        closePopup()
+        if (::floatingView.isInitialized) windowManager.removeView(floatingView)
+    }
+}

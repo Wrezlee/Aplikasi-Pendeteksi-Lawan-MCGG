@@ -1,16 +1,26 @@
 package putra.yanuar.prediksilawanmcgg
 
-import android.app.Notification
+import android.app.Activity
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.Image
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.MotionEvent
@@ -23,21 +33,44 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 
 class TrackingService : Service() {
 
+    // ── Window & UI ───────────────────────────────────────────────────────────
     private lateinit var windowManager: WindowManager
     private lateinit var floatingView: LinearLayout
     private lateinit var collapsedView: Button
     private lateinit var expandedView: LinearLayout
     private lateinit var titleText: TextView
+    private lateinit var ocrStatusText: TextView
     private lateinit var buttonsContainer: LinearLayout
     private lateinit var scrollView: ScrollView
     private lateinit var wmParams: WindowManager.LayoutParams
 
-    // Popup edit yang melayang terpisah dari panel utama
+    // Popup edit terpisah
     private var popupView: LinearLayout? = null
     private var popupParams: WindowManager.LayoutParams? = null
+
+    // ── OCR & Screen Capture ──────────────────────────────────────────────────
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
+    private val ocrExecutor = Executors.newSingleThreadScheduledExecutor()
+    private var ocrTask: ScheduledFuture<*>? = null
+    private val textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    // State OCR
+    private var isOcrEnabled = false
+    private val previouslyVisibleSlots = mutableSetOf<Int>()
+    private val slotCooldown = mutableMapOf<Int, Long>()
+    private val COOLDOWN_MS = 4000L
 
     companion object {
         private const val CHANNEL_ID = "MCGGTrackerChannel"
@@ -45,12 +78,17 @@ class TrackingService : Service() {
         private const val TOTAL_ENEMIES = 7
     }
 
+    // ── Game State ────────────────────────────────────────────────────────────
     private val enemyNames = mutableMapOf<Int, String>()
     private val eliminatedSlots = mutableMapOf<Int, Boolean>()
     private val cycleSlots = ArrayList<Int>()
     private var currentRound = 1
     private var isCycleLocked = false
     private var cycleIndex = 0
+
+    // =========================================================================
+    // Lifecycle
+    // =========================================================================
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -65,10 +103,44 @@ class TrackingService : Service() {
         setupLayouts()
     }
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val resultCode = intent?.getIntExtra("result_code", Activity.RESULT_CANCELED)
+            ?: Activity.RESULT_CANCELED
+        val resultData = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent?.getParcelableExtra("result_data", Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent?.getParcelableExtra("result_data")
+        }
+
+        if (resultCode == Activity.RESULT_OK && resultData != null) {
+            initMediaProjection(resultCode, resultData)
+        }
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        isOcrEnabled = false
+        ocrTask?.cancel(true)
+        ocrExecutor.shutdown()
+        virtualDisplay?.release()
+        mediaProjection?.stop()
+        imageReader?.close()
+        textRecognizer.close()
+        closePopup()
+        if (::floatingView.isInitialized) windowManager.removeView(floatingView)
+    }
+
+    // =========================================================================
+    // Foreground Notification
+    // =========================================================================
+
     private fun startForegroundNotification() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(CHANNEL_ID, "MC GG Tracker", NotificationManager.IMPORTANCE_LOW)
-                .apply { description = "Tracker musuh berjalan di latar belakang" }
+            val ch = NotificationChannel(
+                CHANNEL_ID, "MC GG Tracker", NotificationManager.IMPORTANCE_LOW
+            ).apply { description = "Tracker musuh berjalan di latar belakang" }
             getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
         }
         val notif = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -77,8 +149,185 @@ class TrackingService : Service() {
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
-        startForeground(NOTIF_ID, notif)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIF_ID, notif,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            )
+        } else {
+            startForeground(NOTIF_ID, notif)
+        }
+    } // <-- kurung tutup startForegroundNotification
+
+    // =========================================================================
+    // MediaProjection & OCR
+    // =========================================================================
+
+    private fun initMediaProjection(resultCode: Int, data: Intent) {
+        val mpManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjection = mpManager.getMediaProjection(resultCode, data)
+
+        // Android 14+ wajib register callback sebelum createVirtualDisplay
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    isOcrEnabled = false
+                    virtualDisplay?.release()
+                    updateOcrStatusLabel()
+                }
+            }, Handler(Looper.getMainLooper()))
+        }
+
+        val (screenW, screenH) = getScreenDimensions()
+        val captureW = screenW / 2
+        val captureH = screenH / 2
+        val density = resources.displayMetrics.densityDpi
+
+        imageReader = ImageReader.newInstance(
+            captureW, captureH, PixelFormat.RGBA_8888, 2
+        )
+
+        virtualDisplay = mediaProjection?.createVirtualDisplay(
+            "MCGGCapture",
+            captureW, captureH, density,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            imageReader?.surface, null, null
+        )
+
+        isOcrEnabled = true
+        updateOcrStatusLabel()
+        startOcrLoop()
+        Toast.makeText(this, "OCR Aktif", Toast.LENGTH_SHORT).show()
     }
+
+    private fun startOcrLoop() {
+        ocrTask = ocrExecutor.scheduleAtFixedRate({
+            if (!isOcrEnabled) return@scheduleAtFixedRate
+            val bitmap = captureScreen() ?: return@scheduleAtFixedRate
+            runOcr(bitmap)
+        }, 1500, 1000, TimeUnit.MILLISECONDS)
+    }
+
+    private fun captureScreen(): Bitmap? {
+        return try {
+            val image: Image = imageReader?.acquireLatestImage() ?: return null
+            val plane = image.planes[0]
+            val buffer = plane.buffer
+            val pixelStride = plane.pixelStride
+            val rowStride = plane.rowStride
+            val rowPadding = rowStride - pixelStride * image.width
+
+            val fullBmp = Bitmap.createBitmap(
+                image.width + rowPadding / pixelStride,
+                image.height,
+                Bitmap.Config.ARGB_8888
+            )
+            fullBmp.copyPixelsFromBuffer(buffer)
+            image.close()
+
+            // Crop sisi kanan 40% = area scoreboard musuh
+            val cropX = (fullBmp.width * 0.60).toInt()
+            val cropW = fullBmp.width - cropX
+            val cropped = Bitmap.createBitmap(fullBmp, cropX, 0, cropW, fullBmp.height)
+            fullBmp.recycle()
+            cropped
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun runOcr(bitmap: Bitmap) {
+        val inputImage = InputImage.fromBitmap(bitmap, 0)
+        textRecognizer.process(inputImage)
+            .addOnSuccessListener { visionText ->
+                bitmap.recycle()
+                processOcrResult(visionText.text)
+            }
+            .addOnFailureListener {
+                bitmap.recycle()
+            }
+    }
+
+    private fun processOcrResult(rawText: String) {
+        val now = System.currentTimeMillis()
+        val currentlyVisible = mutableSetOf<Int>()
+
+        for (slot in 1..TOTAL_ENEMIES) {
+            if (eliminatedSlots[slot] == true) continue
+            val name = enemyNames[slot] ?: continue
+            if (name.startsWith("Musuh ")) continue // skip nama default
+
+            if (isNameInText(name, rawText)) {
+                currentlyVisible.add(slot)
+            }
+        }
+
+        // Slot yang BARU muncul di frame ini
+        val newlyAppeared = currentlyVisible - previouslyVisibleSlots
+
+        for (slot in newlyAppeared) {
+            val lastTrigger = slotCooldown[slot] ?: 0L
+            if (now - lastTrigger > COOLDOWN_MS) {
+                slotCooldown[slot] = now
+                mainHandler.post {
+                    handleEnemyTap(slot)
+                    Toast.makeText(
+                        this,
+                        "Auto-detect: ${displayName(slot)}",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
+
+        previouslyVisibleSlots.clear()
+        previouslyVisibleSlots.addAll(currentlyVisible)
+    }
+
+    private fun isNameInText(name: String, text: String): Boolean {
+        if (name.length < 3) return text.contains(name, ignoreCase = true)
+        if (text.contains(name, ignoreCase = true)) return true
+
+        val nameLower = name.lowercase()
+        for (line in text.lines()) {
+            val lineLower = line.trim().lowercase()
+            if (lineLower.isEmpty()) continue
+            if (levenshteinSimilarity(nameLower, lineLower) >= 0.80) return true
+        }
+        return false
+    }
+
+    private fun levenshteinSimilarity(a: String, b: String): Double {
+        val la = a.length; val lb = b.length
+        if (la == 0 || lb == 0) return 0.0
+        val dp = Array(la + 1) { IntArray(lb + 1) }
+        for (i in 0..la) dp[i][0] = i
+        for (j in 0..lb) dp[0][j] = j
+        for (i in 1..la) for (j in 1..lb) {
+            dp[i][j] = if (a[i - 1] == b[j - 1]) dp[i - 1][j - 1]
+            else 1 + minOf(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
+        }
+        return 1.0 - dp[la][lb].toDouble() / maxOf(la, lb)
+    }
+
+    private fun updateOcrStatusLabel() {
+        if (::ocrStatusText.isInitialized) {
+            mainHandler.post {
+                if (isOcrEnabled) {
+                    ocrStatusText.text = "OCR Aktif — Auto detect nyala"
+                    ocrStatusText.setTextColor(Color.parseColor("#88FF88"))
+                } else {
+                    ocrStatusText.text = "Mode Manual — Tap musuh manual"
+                    ocrStatusText.setTextColor(Color.parseColor("#FF8888"))
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // UI Setup
+    // =========================================================================
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -88,13 +337,9 @@ class TrackingService : Service() {
         return Pair(dm.widthPixels, dm.heightPixels)
     }
 
-    private fun isLandscape() =
-        resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
-
     private fun displayName(slot: Int) = enemyNames[slot] ?: "Musuh $slot"
     private fun activeSlots() = (1..TOTAL_ENEMIES).filter { eliminatedSlots[it] == false }
 
-    // ── Layout utama ─────────────────────────────────────────────────────────
     private fun setupLayouts() {
         floatingView = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
@@ -115,7 +360,7 @@ class TrackingService : Service() {
             layoutParams = LinearLayout.LayoutParams(dp(270), LinearLayout.LayoutParams.WRAP_CONTENT)
         }
 
-        // Header
+        // Header row
         val headerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -128,7 +373,7 @@ class TrackingService : Service() {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         val btnClose = Button(this).apply {
-            text = "✕"
+            text = "X"
             textSize = 12f
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#CC991111"))
@@ -140,12 +385,24 @@ class TrackingService : Service() {
         headerRow.addView(btnClose)
         expandedView.addView(headerRow)
 
+        // Status OCR
+        ocrStatusText = TextView(this).apply {
+            text = "Mode Manual — Tap musuh manual"
+            setTextColor(Color.parseColor("#FF8888"))
+            textSize = 9f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { it.setMargins(0, dp(3), 0, dp(2)) }
+        }
+        expandedView.addView(ocrStatusText)
+
         // Divider
         expandedView.addView(View(this).apply {
             setBackgroundColor(Color.parseColor("#55FFFFFF"))
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(1)
-            ).also { it.setMargins(0, dp(5), 0, dp(5)) }
+            ).also { it.setMargins(0, dp(4), 0, dp(4)) }
         })
 
         // Hint
@@ -154,7 +411,8 @@ class TrackingService : Service() {
             setTextColor(Color.parseColor("#99FFFFFF"))
             textSize = 9f
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
             ).also { it.setMargins(0, 0, 0, dp(4)) }
         })
 
@@ -169,7 +427,8 @@ class TrackingService : Service() {
         buttonsContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
             )
         }
         buildEnemyButtons()
@@ -178,7 +437,7 @@ class TrackingService : Service() {
 
         // Reset
         expandedView.addView(Button(this).apply {
-            text = "🔄 RESET SIKLUS"
+            text = "RESET SIKLUS"
             textSize = 11f
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#CC880000"))
@@ -214,13 +473,15 @@ class TrackingService : Service() {
 
     private fun recalcScrollHeight() {
         val (_, h) = getScreenDimensions()
-        val ratio = if (isLandscape()) 0.45 else 0.45
         val lp = scrollView.layoutParams as LinearLayout.LayoutParams
-        lp.height = (h * ratio).toInt()
+        lp.height = (h * 0.45).toInt()
         scrollView.layoutParams = lp
     }
 
-    // ── Tombol musuh ─────────────────────────────────────────────────────────
+    // =========================================================================
+    // Enemy Buttons
+    // =========================================================================
+
     private fun buildEnemyButtons() {
         buttonsContainer.removeAllViews()
 
@@ -229,6 +490,7 @@ class TrackingService : Service() {
             val inCycle = cycleSlots.contains(i)
             val isPredicted = isCycleLocked && !isElim &&
                     cycleSlots.isNotEmpty() && cycleSlots[cycleIndex] == i
+            val isDefaultName = (enemyNames[i] ?: "").startsWith("Musuh ")
 
             val bgColor = when {
                 isElim      -> Color.parseColor("#1A1A1A")
@@ -237,14 +499,14 @@ class TrackingService : Service() {
                 else        -> Color.parseColor("#333355")
             }
             val label = when {
-                isElim      -> "💀 ${displayName(i)}"
-                isPredicted -> "★ ${displayName(i)}"
-                inCycle     -> "✔ ${displayName(i)}"
-                else        -> "⚔ ${displayName(i)}"
+                isElim      -> "ELIM ${displayName(i)}"
+                isPredicted -> "* ${displayName(i)}"
+                inCycle     -> "OK ${displayName(i)}"
+                else        -> "${displayName(i)}"
             }
 
             val btn = Button(this).apply {
-                text = label
+                text = if (isDefaultName && isOcrEnabled) "$label (!)" else label
                 textSize = 11f
                 setPadding(dp(8), 0, dp(8), 0)
                 isEnabled = true
@@ -260,22 +522,41 @@ class TrackingService : Service() {
             }
             buttonsContainer.addView(btn)
         }
+
+        if (isOcrEnabled) {
+            val unnamedCount = (1..TOTAL_ENEMIES).count {
+                eliminatedSlots[it] != true && (enemyNames[it] ?: "").startsWith("Musuh ")
+            }
+            if (unnamedCount > 0) {
+                buttonsContainer.addView(TextView(this).apply {
+                    text = "$unnamedCount musuh belum diberi nama\n(Tahan tombol untuk edit nama)"
+                    setTextColor(Color.parseColor("#FFAA44"))
+                    textSize = 9f
+                    setPadding(dp(4), dp(4), dp(4), dp(4))
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    )
+                })
+            }
+        }
     }
 
-    // ── Popup edit TERPISAH di WindowManager ─────────────────────────────────
-    // Popup ini melayang di tengah layar, TIDAK terpotong apapun
+    // =========================================================================
+    // Edit Popup
+    // =========================================================================
+
     private fun showEditPopup(slot: Int) {
-        closePopup() // tutup popup lama jika ada
+        closePopup()
 
         val isElim = eliminatedSlots[slot] == true
         val name = displayName(slot)
-        val (screenW, screenH) = getScreenDimensions()
+        val (screenW, _) = getScreenDimensions()
 
         val layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
-        // Lebar popup: 80% lebar layar (maks 400dp)
         val popupWidthPx = minOf((screenW * 0.80).toInt(), dp(400))
 
         val container = LinearLayout(this).apply {
@@ -285,28 +566,27 @@ class TrackingService : Service() {
             elevation = 20f
         }
 
-        // Judul popup
         container.addView(TextView(this).apply {
-            text = "✏️ Edit Musuh ${slot}"
+            text = "Edit Musuh $slot"
             setTextColor(Color.WHITE)
             textSize = 14f
             setTypeface(null, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
             ).also { it.setMargins(0, 0, 0, dp(12)) }
         })
 
-        // Label nama
         container.addView(TextView(this).apply {
             text = "Nama musuh:"
             setTextColor(Color.parseColor("#BBFFFFFF"))
             textSize = 11f
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
             ).also { it.setMargins(0, 0, 0, dp(4)) }
         })
 
-        // Input nama
         val editName = EditText(this).apply {
             setText(name)
             setTextColor(Color.WHITE)
@@ -318,12 +598,22 @@ class TrackingService : Service() {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(44)
             ).also { it.setMargins(0, 0, 0, dp(14)) }
-            // Pilih semua teks agar mudah langsung ganti
             selectAll()
         }
         container.addView(editName)
 
-        // Divider
+        if (isOcrEnabled) {
+            container.addView(TextView(this).apply {
+                text = "Nama ini dipakai OCR untuk auto-detect"
+                setTextColor(Color.parseColor("#88AACCFF"))
+                textSize = 9f
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).also { it.setMargins(0, -dp(10), 0, dp(10)) }
+            })
+        }
+
         container.addView(View(this).apply {
             setBackgroundColor(Color.parseColor("#44FFFFFF"))
             layoutParams = LinearLayout.LayoutParams(
@@ -331,12 +621,12 @@ class TrackingService : Service() {
             ).also { it.setMargins(0, 0, 0, dp(12)) }
         })
 
-        // Baris tombol aksi
         val btnRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
             )
         }
 
@@ -351,10 +641,12 @@ class TrackingService : Service() {
             setOnClickListener { action() }
         }
 
-        val btnSave = makeBtn("💾 Simpan", "#CC1A5C1A") {
+        val btnSave = makeBtn("Simpan", "#CC1A5C1A") {
             val newName = editName.text.toString().trim()
             if (newName.isNotEmpty()) {
                 enemyNames[slot] = newName
+                slotCooldown.remove(slot)
+                previouslyVisibleSlots.remove(slot)
                 Toast.makeText(this, "Nama disimpan: $newName", Toast.LENGTH_SHORT).show()
             }
             closePopup()
@@ -363,14 +655,14 @@ class TrackingService : Service() {
         }
 
         val btnElim = makeBtn(
-            if (isElim) "✅ Aktifkan" else "💀 Eliminasi",
+            if (isElim) "Aktifkan" else "Eliminasi",
             if (isElim) "#CC226622" else "#CC881111"
         ) {
             closePopup()
             toggleElimination(slot)
         }
 
-        val btnCancel = makeBtn("✕ Batal", "#CC444444") {
+        val btnCancel = makeBtn("Batal", "#CC444444") {
             closePopup()
         }
 
@@ -379,56 +671,45 @@ class TrackingService : Service() {
         btnRow.addView(btnCancel)
         container.addView(btnRow)
 
-        // Bungkus dalam ScrollView agar aman di landscape
         val sv = ScrollView(this).apply {
             isFillViewport = true
             addView(container)
         }
 
-        // Params popup: DITENGAH layar, focusable agar keyboard bisa muncul
         val pp = WindowManager.LayoutParams(
             popupWidthPx,
             WindowManager.LayoutParams.WRAP_CONTENT,
             layoutFlag,
-            // FOCUSABLE agar EditText bisa diketik
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                     WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.CENTER   // ← selalu di tengah layar
+            gravity = Gravity.CENTER
             x = 0; y = 0
         }
 
-        // Simpan referensi untuk bisa dihapus nanti
-        popupView = container  // simpan container agar bisa di-remove
         popupParams = pp
 
-        // Tambahkan ScrollView (bukan container langsung) ke WindowManager
-        // Tapi kita perlu simpan sv agar bisa di-remove
-        // Gunakan wrapper trick
-        val wrapperRef = arrayOfNulls<LinearLayout>(1)
         val wrapper = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(sv)
         }
-        wrapperRef[0] = wrapper
-
-        windowManager.addView(wrapper, pp)
-
-        // Simpan wrapper di popupView agar closePopup() bisa remove-nya
-        @Suppress("UNCHECKED_CAST")
         popupView = wrapper
+        windowManager.addView(wrapper, pp)
     }
 
     private fun closePopup() {
         popupView?.let {
-            try { windowManager.removeView(it) } catch (_: Exception) {}
+            try { windowManager.removeView(it) } catch (e: Exception) { }
             popupView = null
             popupParams = null
         }
     }
 
-    // ── Handle tap musuh ─────────────────────────────────────────────────────
+    // =========================================================================
+    // Game Logic
+    // =========================================================================
+
     private fun handleEnemyTap(slot: Int) {
         if (eliminatedSlots[slot] == true) {
             Toast.makeText(this, "${displayName(slot)} dieliminasi. Tahan untuk opsi.", Toast.LENGTH_SHORT).show()
@@ -449,7 +730,7 @@ class TrackingService : Service() {
                 isCycleLocked = true
                 cycleIndex = 0
                 val next = cycleSlots[cycleIndex]
-                titleText.text = "Ronde: $currentRound ✅ Terkunci!\nPrediksi:\n★ ${displayName(next)} ★"
+                titleText.text = "Ronde: $currentRound TERKUNCI\nPrediksi:\n* ${displayName(next)} *"
             } else {
                 val rem = active.size - cycleSlots.size
                 titleText.text = "Ronde: $currentRound\nTercatat: ${cycleSlots.size}/${active.size}\nSisa $rem lagi..."
@@ -457,7 +738,7 @@ class TrackingService : Service() {
             buildEnemyButtons()
         } else {
             val expectedSlot = cycleSlots[cycleIndex]
-            val warn = if (slot != expectedSlot) "\n⚠ Tidak sesuai prediksi!" else ""
+            val warn = if (slot != expectedSlot) "\nTidak sesuai prediksi!" else ""
             currentRound++
 
             var nextIndex = (cycleIndex + 1) % cycleSlots.size
@@ -468,17 +749,19 @@ class TrackingService : Service() {
             }
             cycleIndex = nextIndex
             val next = cycleSlots[cycleIndex]
-            titleText.text = "Ronde: $currentRound$warn\nPrediksi selanjutnya:\n★ ${displayName(next)} ★"
+            titleText.text = "Ronde: $currentRound$warn\nPrediksi selanjutnya:\n* ${displayName(next)} *"
             buildEnemyButtons()
         }
     }
 
-    // ── Toggle eliminasi ─────────────────────────────────────────────────────
     private fun toggleElimination(slot: Int) {
         val wasElim = eliminatedSlots[slot] == true
         eliminatedSlots[slot] = !wasElim
 
         if (!wasElim) {
+            previouslyVisibleSlots.remove(slot)
+            slotCooldown.remove(slot)
+
             if (isCycleLocked) {
                 val curSlot = cycleSlots.getOrNull(cycleIndex)
                 if (curSlot == slot) {
@@ -492,28 +775,33 @@ class TrackingService : Service() {
                 }
                 val activeInCycle = cycleSlots.count { eliminatedSlots[it] == false }
                 if (activeInCycle == 0) {
-                    isCycleLocked = false; cycleSlots.clear(); cycleIndex = 0
+                    isCycleLocked = false
+                    cycleSlots.clear()
+                    cycleIndex = 0
                     titleText.text = "Ronde: $currentRound\nSemua musuh dieliminasi!"
-                } else updateDisplay()
+                } else {
+                    updateDisplay()
+                }
             }
-            Toast.makeText(this, "💀 ${displayName(slot)} dieliminasi", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "${displayName(slot)} dieliminasi", Toast.LENGTH_SHORT).show()
         } else {
             val active = activeSlots()
             val inCycle = cycleSlots.filter { eliminatedSlots[it] == false }
-            if (isCycleLocked || (inCycle.size == active.size && cycleSlots.isNotEmpty()))
+            if (isCycleLocked || (inCycle.size == active.size && cycleSlots.isNotEmpty())) {
                 isCycleLocked = true
-            Toast.makeText(this, "✅ ${displayName(slot)} aktif kembali!", Toast.LENGTH_SHORT).show()
+            }
+            Toast.makeText(this, "${displayName(slot)} aktif kembali!", Toast.LENGTH_SHORT).show()
             updateDisplay()
         }
         buildEnemyButtons()
     }
 
     private fun updateDisplay() {
-        val active = activeSlots()
         val inCycle = cycleSlots.filter { eliminatedSlots[it] == false }
+        val active = activeSlots()
         if (isCycleLocked && cycleSlots.isNotEmpty()) {
             val next = cycleSlots[cycleIndex]
-            titleText.text = "Ronde: $currentRound ✅\nPrediksi:\n★ ${displayName(next)} ★"
+            titleText.text = "Ronde: $currentRound\nPrediksi:\n* ${displayName(next)} *"
         } else {
             titleText.text = "Ronde: $currentRound\nTercatat: ${inCycle.size}/${active.size}"
         }
@@ -521,7 +809,11 @@ class TrackingService : Service() {
 
     private fun resetAll() {
         cycleSlots.clear()
-        currentRound = 1; cycleIndex = 0; isCycleLocked = false
+        currentRound = 1
+        cycleIndex = 0
+        isCycleLocked = false
+        previouslyVisibleSlots.clear()
+        slotCooldown.clear()
         for (i in 1..TOTAL_ENEMIES) {
             eliminatedSlots[i] = false
             enemyNames[i] = "Musuh $i"
@@ -531,25 +823,34 @@ class TrackingService : Service() {
         Toast.makeText(this, "Semua di-reset!", Toast.LENGTH_SHORT).show()
     }
 
-    // ── Drag & toggle expand ─────────────────────────────────────────────────
+    // =========================================================================
+    // Drag & Toggle Expand
+    // =========================================================================
+
     private fun setupMovementAndClickLogic() {
-        var initialX = 0; var initialY = 0
-        var initialTouchX = 0f; var initialTouchY = 0f
+        var initialX = 0
+        var initialY = 0
+        var initialTouchX = 0f
+        var initialTouchY = 0f
         var isDragging = false
 
         collapsedView.setOnTouchListener { _, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    initialX = wmParams.x; initialY = wmParams.y
-                    initialTouchX = event.rawX; initialTouchY = event.rawY
-                    isDragging = false; true
+                    initialX = wmParams.x
+                    initialY = wmParams.y
+                    initialTouchX = event.rawX
+                    initialTouchY = event.rawY
+                    isDragging = false
+                    true
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = (event.rawX - initialTouchX).toInt()
                     val dy = (event.rawY - initialTouchY).toInt()
                     if (Math.abs(dx) > 8 || Math.abs(dy) > 8) isDragging = true
                     if (isDragging) {
-                        wmParams.x = initialX + dx; wmParams.y = initialY + dy
+                        wmParams.x = initialX + dx
+                        wmParams.y = initialY + dy
                         windowManager.updateViewLayout(floatingView, wmParams)
                     }
                     true
@@ -573,11 +874,5 @@ class TrackingService : Service() {
                 else -> false
             }
         }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        closePopup()
-        if (::floatingView.isInitialized) windowManager.removeView(floatingView)
     }
 }
